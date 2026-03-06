@@ -4,6 +4,7 @@ import cv2
 import math
 import os
 from PIL import Image
+from tqdm import tqdm
 
 THRESHOLD_RATIO = 2000
 MIN_AVG_RED = 60
@@ -22,6 +23,14 @@ def _sample_seconds_from_env(default_seconds=SAMPLE_SECONDS):
         return value if value > 0 else default_seconds
     except ValueError:
         return default_seconds
+
+
+def _progress_enabled_from_env(default_enabled=False):
+    """Reads optional progress toggle from DCC_PROGRESS env var."""
+    raw = os.getenv("DCC_PROGRESS")
+    if raw is None:
+        return default_enabled
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 def hue_shift_red(mat, h):
 
@@ -183,18 +192,33 @@ def analyze_video(input_video_path, output_video_path):
     filter_matrix_indexes = []
     filter_matrices = []
     count = 0
+    show_progress = _progress_enabled_from_env()
+    video_label = os.path.basename(input_video_path)
+    analyze_pbar = tqdm(
+        total=frame_count,
+        desc=f"{video_label} color correction (analyze)",
+        unit="frame",
+        leave=False,
+        disable=not show_progress,
+    )
 
     print("Analyzing...")
-    # Seek to sampled frames instead of decoding the full stream during analysis.
-    sample_indices = list(range(0, max(frame_count, 1), sample_stride))
-    if sample_indices and sample_indices[-1] != max(frame_count - 1, 0):
-        sample_indices.append(max(frame_count - 1, 0))
+    # Sequential scan is typically faster than random seeks on compressed videos.
+    # Use grab/retrieve so we only decode full frames when sampling.
+    while cap.isOpened():
+        ok = cap.grab()
+        if not ok:
+            break
 
-    for idx in sample_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        count = idx + 1
-        print(f"{count} frames", end="\r")
+        count += 1
+        analyze_pbar.update(1)
+        should_sample = (count % sample_stride == 0) or (count == frame_count)
+        if not should_sample:
+            continue
+
+        ret, frame = cap.retrieve()
+        if not show_progress:
+            print(f"{count} frames", end="\r")
         if not ret:
             continue
 
@@ -203,6 +227,7 @@ def analyze_video(input_video_path, output_video_path):
         filter_matrices.append(get_filter_matrix(mat))
         yield count
 
+    analyze_pbar.close()
     cap.release()
 
     # Fallback: if sampled seeks failed, compute from first readable frame.
@@ -261,11 +286,21 @@ def process_video(video_data, yield_preview=False):
     )
 
     print("Processing...")
+    show_progress = _progress_enabled_from_env()
+    video_label = os.path.basename(video_data["input_video_path"])
+    process_pbar = tqdm(
+        total=frame_count,
+        desc=f"{video_label} color correction",
+        unit="frame",
+        leave=False,
+        disable=not show_progress,
+    )
     count = 0
     while cap.isOpened():
         count += 1
         percent = 100 * count / frame_count
-        print("{:.2f}%".format(percent), end="\r")
+        if not show_progress:
+            print("{:.2f}%".format(percent), end="\r")
         ret, frame = cap.read()
 
         if not ret:
@@ -286,6 +321,7 @@ def process_video(video_data, yield_preview=False):
         corrected_mat = apply_filter(rgb_mat, interpolated_matrices[matrix_idx])
         corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
         new_video.write(corrected_mat)
+        process_pbar.update(1)
 
         if yield_preview:
             preview = frame.copy()
@@ -299,8 +335,7 @@ def process_video(video_data, yield_preview=False):
         else:
             yield None
 
-
-
+    process_pbar.close()
     cap.release()
     new_video.release()
 
