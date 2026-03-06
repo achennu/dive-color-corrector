@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 import math
 import os
+import json
 from PIL import Image
 from tqdm import tqdm
 
@@ -52,6 +53,37 @@ def _progress_desc_from_env(video_label):
         return video_label
     value = raw.strip()
     return value if value else video_label
+
+
+def _progress_file_from_env():
+    """Reads optional machine-readable progress output path from env var."""
+    raw = os.getenv("DCC_PROGRESS_FILE")
+    if raw is None:
+        return None
+    value = raw.strip()
+    return value if value else None
+
+
+def _write_progress_file(phase, current, total):
+    """Writes progress state for parent batch renderer to consume."""
+    progress_path = _progress_file_from_env()
+    if progress_path is None:
+        return
+
+    payload = {
+        "phase": str(phase),
+        "current": int(max(0, current)),
+        "total": int(max(1, total)),
+    }
+
+    temp_path = f"{progress_path}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as progress_file:
+            json.dump(payload, progress_file)
+        os.replace(temp_path, progress_path)
+    except OSError:
+        # Progress telemetry is best-effort and should never break processing.
+        pass
 
 def hue_shift_red(mat, h):
 
@@ -225,6 +257,7 @@ def analyze_video(input_video_path, output_video_path):
         dynamic_ncols=True,
         disable=not show_progress,
     )
+    _write_progress_file("analyze", 0, frame_count)
 
     if not show_progress:
         print("Analyzing...")
@@ -237,6 +270,8 @@ def analyze_video(input_video_path, output_video_path):
 
         count += 1
         analyze_pbar.update(1)
+        if count % 10 == 0 or count == frame_count:
+            _write_progress_file("analyze", count, frame_count)
         should_sample = (count % sample_stride == 0) or (count == frame_count)
         if not should_sample:
             continue
@@ -253,6 +288,7 @@ def analyze_video(input_video_path, output_video_path):
         yield count
 
     analyze_pbar.close()
+    _write_progress_file("analyze", frame_count, frame_count)
     cap.release()
 
     # Fallback: if sampled seeks failed, compute from first readable frame.
@@ -325,6 +361,7 @@ def process_video(video_data, yield_preview=False):
         dynamic_ncols=True,
         disable=not show_progress,
     )
+    _write_progress_file("color", 0, frame_count)
     count = 0
     while cap.isOpened():
         count += 1
@@ -352,6 +389,8 @@ def process_video(video_data, yield_preview=False):
         corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
         new_video.write(corrected_mat)
         process_pbar.update(1)
+        if count % 10 == 0 or count == frame_count:
+            _write_progress_file("color", count, frame_count)
 
         if yield_preview:
             preview = frame.copy()
@@ -366,6 +405,7 @@ def process_video(video_data, yield_preview=False):
             yield None
 
     process_pbar.close()
+    _write_progress_file("color", frame_count, frame_count)
     cap.release()
     new_video.release()
 
