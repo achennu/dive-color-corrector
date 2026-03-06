@@ -2,6 +2,7 @@ import sys
 import numpy as np
 import cv2
 import math
+import os
 from PIL import Image
 
 THRESHOLD_RATIO = 2000
@@ -9,6 +10,18 @@ MIN_AVG_RED = 60
 MAX_HUE_SHIFT = 120
 BLUE_MAGIC_VALUE = 1.2
 SAMPLE_SECONDS = 2 # Extracts color correction from every N seconds
+
+
+def _sample_seconds_from_env(default_seconds=SAMPLE_SECONDS):
+    """Reads optional sampling interval override from DCC_SAMPLE_SECONDS env var."""
+    raw = os.getenv("DCC_SAMPLE_SECONDS")
+    if not raw:
+        return default_seconds
+    try:
+        value = int(raw)
+        return value if value > 0 else default_seconds
+    except ValueError:
+        return default_seconds
 
 def hue_shift_red(mat, h):
 
@@ -37,11 +50,16 @@ def normalizing_interval(array):
     return (low, high)
 
 def apply_filter(mat, filt):
-    filtered_mat = np.zeros_like(mat, dtype=np.float32)
-    filtered_mat[..., 0] = mat[..., 0] * filt[0] + mat[..., 1] * filt[1] + mat[..., 2] * filt[2] + filt[4] * 255
-    filtered_mat[..., 1] = mat[..., 1] * filt[6] + filt[9] * 255
-    filtered_mat[..., 2] = mat[..., 2] * filt[12] + filt[14] * 255
-    return np.clip(filtered_mat, 0, 255).astype(np.uint8)
+    # Use OpenCV's native transform for faster per-frame matrix application.
+    transform = np.array([
+        [filt[0], filt[1], filt[2]],
+        [0.0, filt[6], 0.0],
+        [0.0, 0.0, filt[12]],
+    ], dtype=np.float32)
+    offset = np.array([filt[4] * 255, filt[9] * 255, filt[14] * 255], dtype=np.float32)
+    transformed = cv2.transform(mat.astype(np.float32), transform)
+    transformed += offset
+    return np.clip(transformed, 0, 255).astype(np.uint8)
 
 def get_filter_matrix(mat):
 
@@ -49,7 +67,7 @@ def get_filter_matrix(mat):
 
     # Get average values of RGB
     avg_mat = np.array(cv2.mean(mat)[:3], dtype=np.uint8)
-    
+
     # Find hue shift so that average red reaches MIN_AVG_RED
     new_avg_r = avg_mat[0]
     hue_shift = 0
@@ -75,7 +93,7 @@ def get_filter_matrix(mat):
     normalize_mat = np.zeros((256, 3))
     threshold_level = (mat.shape[0]*mat.shape[1])/THRESHOLD_RATIO
     for x in range(256):
-        
+
         if hist_r[x] < threshold_level:
             normalize_mat[x][0] = x
 
@@ -120,7 +138,7 @@ def correct(mat):
     original_mat = mat.copy()
 
     filter_matrix = get_filter_matrix(mat)
-    
+
     corrected_mat = apply_filter(original_mat, filter_matrix)
     corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
 
@@ -142,7 +160,7 @@ def correct_image(input_path, output_path):
     if exif_data:
         save_kwargs["exif"] = exif_data
     output_image.save(output_path, **save_kwargs)
-    
+
     preview = mat.copy()
     width = preview.shape[1] // 2
     preview[::, width:] = corrected_mat[::, width:]
@@ -153,53 +171,66 @@ def correct_image(input_path, output_path):
 
 
 def analyze_video(input_video_path, output_video_path):
-    
+
     # Initialize new video writer
     cap = cv2.VideoCapture(input_video_path)
-    fps = math.ceil(cap.get(cv2.CAP_PROP_FPS))
-    frame_count = math.ceil(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+    fps = max(1, math.ceil(cap.get(cv2.CAP_PROP_FPS)))
+    frame_count = max(1, math.ceil(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    sample_seconds = _sample_seconds_from_env()
+    sample_stride = max(1, fps * sample_seconds)
+
     # Get filter matrices for every 10th frame
     filter_matrix_indexes = []
     filter_matrices = []
     count = 0
-    
+
     print("Analyzing...")
-    while(cap.isOpened()):
-        
-        count += 1  
-        print(f"{count} frames", end="\r")
+    # Seek to sampled frames instead of decoding the full stream during analysis.
+    sample_indices = list(range(0, max(frame_count, 1), sample_stride))
+    if sample_indices and sample_indices[-1] != max(frame_count - 1, 0):
+        sample_indices.append(max(frame_count - 1, 0))
+
+    for idx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
+        count = idx + 1
+        print(f"{count} frames", end="\r")
         if not ret:
-            # End video read if we have gone beyond reported frame count
-            if count >= frame_count:
-                break
-
-            # Failsafe to prevent an infinite loop
-            if count >= 1e6:
-                break
-
-            # Otherwise this is just a faulty frame read, try reading next frame
             continue
 
-        # Pick filter matrix from every N seconds
-        if count % (fps * SAMPLE_SECONDS) == 0:
-            mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            filter_matrix_indexes.append(count) 
-            filter_matrices.append(get_filter_matrix(mat))
-
+        mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        filter_matrix_indexes.append(count)
+        filter_matrices.append(get_filter_matrix(mat))
         yield count
-        
+
     cap.release()
 
-    # Build a interpolation function to get filter matrix at any given frame
+    # Fallback: if sampled seeks failed, compute from first readable frame.
+    if not filter_matrices:
+        cap = cv2.VideoCapture(input_video_path)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            filter_matrix_indexes = [1]
+            filter_matrices = [get_filter_matrix(mat)]
+        else:
+            filter_matrix_indexes = [1]
+            filter_matrices = [np.array([
+                1, 0, 0, 0, 0,
+                0, 1, 0, 0, 0,
+                0, 0, 1, 0, 0,
+                0, 0, 0, 1, 0,
+            ], dtype=np.float32)]
+
+    # Build an interpolation function to get filter matrix at any given frame
     filter_matrices = np.array(filter_matrices)
 
     yield {
         "input_video_path": input_video_path,
         "output_video_path": output_video_path,
         "fps": fps,
-        "frame_count": count,
+        "frame_count": frame_count,
         "filters": filter_matrices,
         "filter_indices": filter_matrix_indexes
     }
@@ -217,7 +248,7 @@ def process_video(video_data, yield_preview=False):
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = video_data["fps"]
-    frame_count = video_data["frame_count"]
+    frame_count = max(1, int(video_data["frame_count"]))
 
     # Initialize VideoWriter
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -236,7 +267,7 @@ def process_video(video_data, yield_preview=False):
         percent = 100 * count / frame_count
         print("{:.2f}%".format(percent), end="\r")
         ret, frame = cap.read()
-        
+
         if not ret:
             # End video read if we have gone beyond reported frame count
             if count >= frame_count:
@@ -251,7 +282,8 @@ def process_video(video_data, yield_preview=False):
 
         # Apply the filter using precomputed matrix
         rgb_mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        corrected_mat = apply_filter(rgb_mat, interpolated_matrices[count - 1])
+        matrix_idx = min(count - 1, frame_count - 1)
+        corrected_mat = apply_filter(rgb_mat, interpolated_matrices[matrix_idx])
         corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
         new_video.write(corrected_mat)
 
@@ -267,7 +299,7 @@ def process_video(video_data, yield_preview=False):
         else:
             yield None
 
-    
+
 
     cap.release()
     new_video.release()
@@ -288,17 +320,17 @@ if __name__ == "__main__":
     if (sys.argv[1]) == "image":
         mat = cv2.imread(sys.argv[2])
         mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
-        
+
         corrected_mat = correct(mat)
 
         cv2.imwrite(sys.argv[3], corrected_mat)
-    
+
     else:
 
         for item in analyze_video(sys.argv[2], sys.argv[3]):
 
             if type(item) == dict:
                 video_data = item
-            
+
         [x for x in process_video(video_data, yield_preview=False)]
-        
+
