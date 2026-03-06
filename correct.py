@@ -32,6 +32,27 @@ def _progress_enabled_from_env(default_enabled=False):
         return default_enabled
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _progress_position_from_env(default_position=0):
+    """Reads optional tqdm row position from DCC_PROGRESS_POSITION env var."""
+    raw = os.getenv("DCC_PROGRESS_POSITION")
+    if raw is None:
+        return default_position
+    try:
+        value = int(raw)
+        return value if value >= 0 else default_position
+    except ValueError:
+        return default_position
+
+
+def _progress_desc_from_env(video_label):
+    """Reads optional progress label from DCC_PROGRESS_DESC env var."""
+    raw = os.getenv("DCC_PROGRESS_DESC")
+    if raw is None:
+        return video_label
+    value = raw.strip()
+    return value if value else video_label
+
 def hue_shift_red(mat, h):
 
     U = math.cos(h * math.pi / 180)
@@ -193,16 +214,20 @@ def analyze_video(input_video_path, output_video_path):
     filter_matrices = []
     count = 0
     show_progress = _progress_enabled_from_env()
-    video_label = os.path.basename(input_video_path)
+    video_label = _progress_desc_from_env(os.path.basename(input_video_path))
+    progress_position = _progress_position_from_env()
     analyze_pbar = tqdm(
         total=frame_count,
-        desc=f"{video_label} color correction (analyze)",
+        desc=f"{video_label} analyze",
         unit="frame",
         leave=False,
+        position=progress_position,
+        dynamic_ncols=True,
         disable=not show_progress,
     )
 
-    print("Analyzing...")
+    if not show_progress:
+        print("Analyzing...")
     # Sequential scan is typically faster than random seeks on compressed videos.
     # Use grab/retrieve so we only decode full frames when sampling.
     while cap.isOpened():
@@ -280,19 +305,24 @@ def process_video(video_data, yield_preview=False):
     new_video = cv2.VideoWriter(video_data["output_video_path"], fourcc, fps, (frame_width, frame_height))
 
     # Precompute interpolated filter matrices
-    print("Precomputing filter matrices...")
+    show_progress = _progress_enabled_from_env()
+    if not show_progress:
+        print("Precomputing filter matrices...")
     interpolated_matrices = precompute_filter_matrices(
         frame_count, video_data["filter_indices"], np.array(video_data["filters"])
     )
 
-    print("Processing...")
-    show_progress = _progress_enabled_from_env()
-    video_label = os.path.basename(video_data["input_video_path"])
+    if not show_progress:
+        print("Processing...")
+    video_label = _progress_desc_from_env(os.path.basename(video_data["input_video_path"]))
+    progress_position = _progress_position_from_env()
     process_pbar = tqdm(
         total=frame_count,
-        desc=f"{video_label} color correction",
+        desc=f"{video_label} color",
         unit="frame",
         leave=False,
+        position=progress_position,
+        dynamic_ncols=True,
         disable=not show_progress,
     )
     count = 0
@@ -341,31 +371,34 @@ def process_video(video_data, yield_preview=False):
 
 
 if __name__ == "__main__":
+    try:
+        if len(sys.argv) < 2:
+            print("Usage")
+            print("-"*20)
+            print("For image:")
+            print("$python correct.py image <source_image_path> <output_image_path>\n")
+            print("-"*20)
+            print("For video:")
+            print("$python correct.py video <source_video_path> <output_video_path>\n")
+            exit(0)
 
-    if len(sys.argv) < 2:
-        print("Usage")
-        print("-"*20)
-        print("For image:")
-        print("$python correct.py image <source_image_path> <output_image_path>\n")
-        print("-"*20)
-        print("For video:")
-        print("$python correct.py video <source_video_path> <output_video_path>\n")
-        exit(0)
+        if (sys.argv[1]) == "image":
+            mat = cv2.imread(sys.argv[2])
+            mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
 
-    if (sys.argv[1]) == "image":
-        mat = cv2.imread(sys.argv[2])
-        mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
+            corrected_mat = correct(mat)
 
-        corrected_mat = correct(mat)
+            cv2.imwrite(sys.argv[3], corrected_mat)
 
-        cv2.imwrite(sys.argv[3], corrected_mat)
+        else:
 
-    else:
+            for item in analyze_video(sys.argv[2], sys.argv[3]):
 
-        for item in analyze_video(sys.argv[2], sys.argv[3]):
+                if type(item) == dict:
+                    video_data = item
 
-            if type(item) == dict:
-                video_data = item
-
-        [x for x in process_video(video_data, yield_preview=False)]
+            [x for x in process_video(video_data, yield_preview=False)]
+    except KeyboardInterrupt:
+        print("Interrupted.")
+        raise SystemExit(130)
 
