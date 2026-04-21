@@ -250,14 +250,14 @@ def analyze_video(input_video_path, output_video_path):
     progress_position = _progress_position_from_env()
     analyze_pbar = tqdm(
         total=frame_count,
-        desc=f"{video_label} analyze",
+        desc=f"{video_label} color-analyze",
         unit="frame",
         leave=False,
         position=progress_position,
         dynamic_ncols=True,
         disable=not show_progress,
     )
-    _write_progress_file("analyze", 0, frame_count)
+    _write_progress_file("color-analyze", 0, frame_count)
 
     if not show_progress:
         print("Analyzing...")
@@ -271,7 +271,7 @@ def analyze_video(input_video_path, output_video_path):
         count += 1
         analyze_pbar.update(1)
         if count % 10 == 0 or count == frame_count:
-            _write_progress_file("analyze", count, frame_count)
+            _write_progress_file("color-analyze", count, frame_count)
         should_sample = (count % sample_stride == 0) or (count == frame_count)
         if not should_sample:
             continue
@@ -288,7 +288,7 @@ def analyze_video(input_video_path, output_video_path):
         yield count
 
     analyze_pbar.close()
-    _write_progress_file("analyze", frame_count, frame_count)
+    _write_progress_file("color-analyze", frame_count, frame_count)
     cap.release()
 
     # Fallback: if sampled seeks failed, compute from first readable frame.
@@ -354,14 +354,14 @@ def process_video(video_data, yield_preview=False):
     progress_position = _progress_position_from_env()
     process_pbar = tqdm(
         total=frame_count,
-        desc=f"{video_label} color",
+        desc=f"{video_label} color-apply",
         unit="frame",
         leave=False,
         position=progress_position,
         dynamic_ncols=True,
         disable=not show_progress,
     )
-    _write_progress_file("color", 0, frame_count)
+    _write_progress_file("color-apply", 0, frame_count)
     count = 0
     while cap.isOpened():
         count += 1
@@ -390,7 +390,7 @@ def process_video(video_data, yield_preview=False):
         new_video.write(corrected_mat)
         process_pbar.update(1)
         if count % 10 == 0 or count == frame_count:
-            _write_progress_file("color", count, frame_count)
+            _write_progress_file("color-apply", count, frame_count)
 
         if yield_preview:
             preview = frame.copy()
@@ -405,7 +405,7 @@ def process_video(video_data, yield_preview=False):
             yield None
 
     process_pbar.close()
-    _write_progress_file("color", frame_count, frame_count)
+    _write_progress_file("color-apply", frame_count, frame_count)
     cap.release()
     new_video.release()
 
